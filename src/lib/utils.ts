@@ -53,7 +53,8 @@ export function debugLog(message: string, ...args: any[]) {
 
   const serverUrlHash = global.currentServerUrlHash
   if (!serverUrlHash) {
-    console.error('[DEBUG LOG ERROR] global.currentServerUrlHash is not set. Cannot write debug log.')
+    // Early startup logs can happen before the server hash is known.
+    // In that case, skip file-backed debug logging silently.
     return
   }
 
@@ -372,7 +373,8 @@ export async function discoverOAuthServerInfo(
  * Type for the auth initialization function
  */
 export type AuthInitializer = () => Promise<{
-  waitForAuthCode: () => Promise<string>
+  waitForAuthCode?: () => Promise<string>
+  waitForTokens?: () => Promise<void>
   skipBrowserAuth: boolean
 }>
 
@@ -509,12 +511,31 @@ export async function connectToRemoteServer(
 
       // Initialize authentication on-demand
       debugLog('Calling authInitializer to start auth flow')
-      const { waitForAuthCode, skipBrowserAuth } = await authInitializer()
+      const { waitForAuthCode, waitForTokens, skipBrowserAuth } = await authInitializer()
 
       if (skipBrowserAuth) {
         log('Authentication required but skipping browser auth - using shared auth')
       } else {
         log('Authentication required. Waiting for authorization...')
+      }
+
+      if (waitForTokens) {
+        debugLog('Waiting for shared token exchange to complete')
+        await waitForTokens()
+        debugLog('Shared token exchange completed, reconnecting')
+
+        if (recursionReasons.has(REASON_AUTH_NEEDED)) {
+          const errorMessage = `Already attempted reconnection for reason: ${REASON_AUTH_NEEDED}. Giving up.`
+          log(errorMessage)
+          throw new Error(errorMessage)
+        }
+
+        recursionReasons.add(REASON_AUTH_NEEDED)
+        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
+      }
+
+      if (!waitForAuthCode) {
+        throw new Error('Auth initializer did not provide a callback or token wait strategy')
       }
 
       // Wait for the authorization code from the callback
@@ -570,6 +591,7 @@ export async function connectToRemoteServer(
  */
 export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServerOptions) {
   let authCode: string | null = null
+  let authState: string | null = null
   const app = express()
 
   // Create a promise to track when auth is completed
@@ -579,7 +601,8 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
   })
 
   // Long-polling endpoint
-  app.get('/wait-for-auth', (req, res) => {
+  if (!options.listenOnly) {
+    app.get('/wait-for-auth', (req, res) => {
     if (authCode) {
       // Auth already completed - just return 200 without the actual code
       // Secondary instances will read tokens from disk
@@ -616,17 +639,24 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
           res.status(500).send('Authentication failed')
         }
       })
-  })
+    })
+  }
 
   // OAuth callback endpoint
   app.get(options.path, (req, res) => {
     const code = req.query.code as string | undefined
+    const state = req.query.state as string | undefined
     if (!code) {
       res.status(400).send('Error: No authorization code received')
       return
     }
+    if (!state) {
+      res.status(400).send('Error: No state received')
+      return
+    }
 
     authCode = code
+    authState = state
     log('Auth code received, resolving promise')
     authCompletedResolve(code)
 
@@ -642,7 +672,7 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
     `)
 
     // Notify main flow that auth code is available
-    options.events.emit('auth-code-received', code)
+    options.events.emit('auth-code-received', { code, state })
   })
 
   const server = app.listen(options.port, '127.0.0.1', () => {
@@ -656,13 +686,13 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
         return
       }
 
-      options.events.once('auth-code-received', (code) => {
+      options.events.once('auth-code-received', ({ code }) => {
         resolve(code)
       })
     })
   }
 
-  return { server, authCode, waitForAuthCode, authCompletedPromise }
+  return { server, authCode, authState, waitForAuthCode, authCompletedPromise }
 }
 
 /**
@@ -754,8 +784,13 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     i++
   }
 
+  const callbackPortIndex = args.indexOf('--callback-port')
+  const callbackPortFlag =
+    callbackPortIndex !== -1 && callbackPortIndex < args.length - 1 ? parseInt(args[callbackPortIndex + 1], 10) : undefined
+  const positionalPort = args[1] && !args[1].startsWith('--') ? parseInt(args[1], 10) : undefined
+  const specifiedPort = callbackPortFlag ?? positionalPort
+  const listenOnly = args.includes('--listen-only')
   const serverUrl = args[0]
-  const specifiedPort = args[1] ? parseInt(args[1]) : undefined
   const allowHttp = args.includes('--allow-http')
 
   // Check for debug flag
@@ -770,6 +805,10 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   if (silent) {
     SILENT = true
     log('Silent mode enabled - stderr output will be suppressed, except when --debug is also enabled')
+  }
+
+  if (listenOnly) {
+    log('Listen-only mode enabled')
   }
 
   const enableProxy = args.includes('--enable-proxy')
@@ -932,6 +971,8 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   return {
     serverUrl,
     callbackPort,
+    callbackPortSpecified: specifiedPort !== undefined,
+    listenOnly,
     headers,
     transportStrategy,
     host,

@@ -1,4 +1,20 @@
-import { checkLockfile, createLockfile, deleteLockfile, getConfigFilePath, LockfileData } from './mcp-auth-config'
+/**
+ * @deprecated
+ * This module contains the legacy auth coordination model that assumes a single
+ * auth-owning process can keep a callback listener alive and coordinate other
+ * processes via PID and long-polling. The active Codex fix design does not use
+ * this module for the proxy path.
+ *
+ * The current proxy implementation uses:
+ * - fixed callback port mode in normal operation
+ * - listener-only callback processing
+ * - auth lock coordination keyed by serverUrlHash
+ * - OAuth state routing in the format `<uuid>:<serverUrlHash>`
+ *
+ * Keep this module only for compatibility with older entry points until it can
+ * be removed cleanly.
+ */
+import { readAuthLock, writeAuthLock, deleteAuthLock, getConfigFilePath, AuthLockData } from './mcp-auth-config'
 import { EventEmitter } from 'events'
 import { Server } from 'http'
 import express from 'express'
@@ -31,7 +47,7 @@ export async function isPidRunning(pid: number): Promise<boolean> {
  * @param lockData The lockfile data
  * @returns True if the lockfile is valid, false otherwise
  */
-export async function isLockValid(lockData: LockfileData): Promise<boolean> {
+export async function isLockValid(lockData: AuthLockData): Promise<boolean> {
   debugLog('Checking if lockfile is valid', lockData)
 
   // Check if the lockfile is too old (over 30 minutes)
@@ -46,7 +62,7 @@ export async function isLockValid(lockData: LockfileData): Promise<boolean> {
   }
 
   // Check if the process is still running
-  if (!(await isPidRunning(lockData.pid))) {
+  if (!lockData.pid || !(await isPidRunning(lockData.pid))) {
     log('Process from lockfile is not running')
     debugLog('Process from lockfile is not running', { pid: lockData.pid })
     return false
@@ -54,6 +70,10 @@ export async function isLockValid(lockData: LockfileData): Promise<boolean> {
 
   // Check if the endpoint is accessible
   try {
+    if (!lockData.port) {
+      return false
+    }
+
     debugLog('Checking if endpoint is accessible', { port: lockData.port })
 
     const controller = new AbortController()
@@ -171,7 +191,7 @@ export async function coordinateAuth(
   debugLog('Coordinating authentication', { serverUrlHash, callbackPort })
 
   // Check for a lockfile (disabled on Windows for the time being)
-  const lockData = process.platform === 'win32' ? null : await checkLockfile(serverUrlHash)
+  const lockData = process.platform === 'win32' ? null : await readAuthLock(serverUrlHash)
 
   if (process.platform === 'win32') {
     debugLog('Skipping lockfile check on Windows')
@@ -186,7 +206,7 @@ export async function coordinateAuth(
     try {
       // Try to wait for the authentication to complete
       debugLog('Waiting for authentication from other instance')
-      const authCompleted = await waitForAuthentication(lockData.port)
+      const authCompleted = await waitForAuthentication(lockData.port || callbackPort)
 
       if (authCompleted) {
         log('Authentication completed by another instance. Using tokens from disk')
@@ -218,11 +238,11 @@ export async function coordinateAuth(
 
     // If we get here, the other process didn't complete auth successfully
     debugLog('Other instance did not complete auth successfully, deleting lockfile')
-    await deleteLockfile(serverUrlHash)
+    await deleteAuthLock(serverUrlHash)
   } else if (lockData) {
     // Invalid lockfile, delete it
     log('Found invalid lockfile, deleting it')
-    await deleteLockfile(serverUrlHash)
+    await deleteAuthLock(serverUrlHash)
   }
 
   // Create our own lockfile
@@ -249,13 +269,21 @@ export async function coordinateAuth(
   debugLog('OAuth callback server running', { port: actualPort })
 
   log(`Creating lockfile for server ${serverUrlHash} with process ${process.pid} on port ${actualPort}`)
-  await createLockfile(serverUrlHash, process.pid, actualPort)
+  await writeAuthLock(serverUrlHash, {
+    state: `legacy:${serverUrlHash}`,
+    serverUrlHash,
+    resource: '',
+    timestamp: Date.now(),
+    status: 'pending',
+    pid: process.pid,
+    port: actualPort,
+  })
 
   // Make sure lockfile is deleted on process exit
   const cleanupHandler = async () => {
     try {
       log(`Cleaning up lockfile for server ${serverUrlHash}`)
-      await deleteLockfile(serverUrlHash)
+      await deleteAuthLock(serverUrlHash)
     } catch (error) {
       log(`Error cleaning up lockfile: ${error}`)
       debugLog('Error cleaning up lockfile', error)

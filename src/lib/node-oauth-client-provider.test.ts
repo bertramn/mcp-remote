@@ -3,6 +3,7 @@ import { NodeOAuthClientProvider } from './node-oauth-client-provider'
 import * as mcpAuthConfig from './mcp-auth-config'
 import type { OAuthProviderOptions } from './types'
 import type { AuthorizationServerMetadata } from './authorization-server-metadata'
+import open from 'open'
 
 vi.mock('./mcp-auth-config')
 vi.mock('./authorization-server-metadata', () => ({
@@ -22,6 +23,8 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
   let mockReadJsonFile: any
   let mockWriteJsonFile: any
   let mockDeleteConfigFile: any
+  let mockReadAuthLock: any
+  let mockWriteAuthLock: any
 
   const defaultOptions: OAuthProviderOptions = {
     serverUrl: 'https://example.com',
@@ -34,10 +37,14 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     mockReadJsonFile = vi.mocked(mcpAuthConfig.readJsonFile)
     mockWriteJsonFile = vi.mocked(mcpAuthConfig.writeJsonFile)
     mockDeleteConfigFile = vi.mocked(mcpAuthConfig.deleteConfigFile)
+    mockReadAuthLock = vi.mocked(mcpAuthConfig.readAuthLock)
+    mockWriteAuthLock = vi.mocked(mcpAuthConfig.writeAuthLock)
 
     mockReadJsonFile.mockResolvedValue(undefined)
     mockWriteJsonFile.mockResolvedValue(undefined)
     mockDeleteConfigFile.mockResolvedValue(undefined)
+    mockReadAuthLock.mockResolvedValue(null)
+    mockWriteAuthLock.mockResolvedValue(undefined)
   })
 
   afterEach(() => {
@@ -103,6 +110,52 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       await provider.redirectToAuthorization(authUrl)
 
       expect(authUrl.searchParams.get('scope')).toBe('openid email profile')
+    })
+
+    it('should not reopen the browser for the same pending auth state', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const existingLock = {
+        state: provider.state(),
+        serverUrlHash: 'test-hash',
+        resource: '',
+        timestamp: Date.now(),
+        status: 'pending' as const,
+        authorizationUrl: 'https://auth.example.com/authorize?existing=1',
+        port: 8080,
+      }
+
+      mockReadAuthLock.mockResolvedValue(existingLock)
+
+      const authUrl = new URL('https://auth.example.com/authorize?new=1')
+      await provider.redirectToAuthorization(authUrl)
+
+      expect(mockWriteAuthLock).toHaveBeenCalledWith('test-hash', {
+        ...existingLock,
+        authorizationUrl: 'https://auth.example.com/authorize?existing=1',
+        port: 8080,
+      })
+      expect(open).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('code verifier reuse', () => {
+    it('should not overwrite the verifier for the same pending auth state', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      mockReadAuthLock.mockResolvedValue({
+        state: provider.state(),
+        serverUrlHash: 'test-hash',
+        resource: '',
+        timestamp: Date.now(),
+        status: 'pending' as const,
+        codeVerifier: 'existing-verifier',
+        port: 8080,
+      })
+
+      await provider.saveCodeVerifier('new-verifier')
+
+      expect(mockWriteAuthLock).not.toHaveBeenCalled()
     })
   })
 

@@ -10,7 +10,10 @@
  */
 
 import { EventEmitter } from 'events'
+import type { Server } from 'http'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import {
   connectToRemoteServer,
   log,
@@ -20,17 +23,208 @@ import {
   setupSignalHandlers,
   TransportStrategy,
   discoverOAuthServerInfo,
+  MCP_REMOTE_VERSION,
+  setupOAuthCallbackServerWithLongPoll,
 } from './lib/utils'
 import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
-import { createLazyAuthCoordinator } from './lib/coordination'
+import { deleteAuthLock, readAuthLock, writeAuthLock } from './lib/mcp-auth-config'
 
-/**
- * Main function to run the proxy
- */
+const AUTH_LOCK_TTL_MS = 10 * 60 * 1000
+const TOKEN_WAIT_TIMEOUT_MS = 10 * 60 * 1000
+const TOKEN_WAIT_POLL_MS = 3000
+
+function getClientName(authorizeResource: string): string {
+  if (!authorizeResource) {
+    return 'MCP CLI Proxy'
+  }
+
+  try {
+    const resourceUrl = new URL(authorizeResource)
+    return `MCP CLI Proxy (${resourceUrl.host})`
+  } catch {
+    const cleaned = authorizeResource.replace(/^https?:\/\//, '').replace(/\/+$/, '')
+    return cleaned ? `MCP CLI Proxy (${cleaned})` : 'MCP CLI Proxy'
+  }
+}
+
+function isAuthLockStale(timestamp: number): boolean {
+  return Date.now() - timestamp > AUTH_LOCK_TTL_MS
+}
+
+async function waitForTokens(authProvider: NodeOAuthClientProvider): Promise<void> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < TOKEN_WAIT_TIMEOUT_MS) {
+    const tokens = await authProvider.tokens()
+    if (tokens?.access_token) {
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, TOKEN_WAIT_POLL_MS))
+  }
+  throw new Error('Timed out waiting for shared token exchange to complete')
+}
+
+async function createAuthProvider(
+  serverUrl: string,
+  callbackPort: number,
+  headers: Record<string, string>,
+  host: string,
+  staticOAuthClientMetadata: StaticOAuthClientMetadata,
+  staticOAuthClientInfo: StaticOAuthClientInformationFull,
+  authorizeResource: string,
+  serverUrlHash: string,
+) {
+  log('Discovering OAuth server configuration...')
+  const discoveryResult = await discoverOAuthServerInfo(serverUrl, headers)
+
+  if (discoveryResult.protectedResourceMetadata) {
+    log(`Discovered authorization server: ${discoveryResult.authorizationServerUrl}`)
+  } else {
+    debugLog('No Protected Resource Metadata found, using server URL as authorization server')
+  }
+
+  return new NodeOAuthClientProvider({
+    serverUrl: discoveryResult.authorizationServerUrl,
+    callbackPort,
+    host,
+    clientName: getClientName(authorizeResource),
+    staticOAuthClientMetadata,
+    staticOAuthClientInfo,
+    authorizeResource,
+    serverUrlHash,
+    authorizationServerMetadata: discoveryResult.authorizationServerMetadata,
+    protectedResourceMetadata: discoveryResult.protectedResourceMetadata,
+    wwwAuthenticateScope: discoveryResult.wwwAuthenticateScope,
+  })
+}
+
+function createTransport(
+  serverUrl: string,
+  headers: Record<string, string>,
+  authProvider: NodeOAuthClientProvider,
+  transportStrategy: TransportStrategy,
+) {
+  const url = new URL(serverUrl)
+  const sseTransport = transportStrategy === 'sse-only' || transportStrategy === 'sse-first'
+  if (sseTransport) {
+    return new SSEClientTransport(url, {
+      authProvider,
+      requestInit: { headers },
+    })
+  }
+  return new StreamableHTTPClientTransport(url, {
+    authProvider,
+    requestInit: { headers },
+  })
+}
+
+async function waitForServerListening(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.off('listening', onListening)
+      reject(error)
+    }
+    const onListening = () => {
+      server.off('error', onError)
+      resolve()
+    }
+    server.once('error', onError)
+    server.once('listening', onListening)
+  })
+}
+
+async function runListenerOnly(
+  serverUrl: string,
+  callbackPort: number,
+  headers: Record<string, string>,
+  transportStrategy: TransportStrategy,
+  host: string,
+  staticOAuthClientMetadata: StaticOAuthClientMetadata,
+  staticOAuthClientInfo: StaticOAuthClientInformationFull,
+  authTimeoutMs: number,
+) {
+  log(`Starting mcp-remote proxy ${MCP_REMOTE_VERSION} (local patched build)`)
+
+  const events = new EventEmitter()
+  const { server } = setupOAuthCallbackServerWithLongPoll({
+    port: callbackPort,
+    path: '/oauth/callback',
+    events,
+    authTimeoutMs,
+    listenOnly: true,
+  })
+
+  try {
+    await waitForServerListening(server)
+  } catch (error) {
+    log(`Fatal error: cannot bind callback port ${callbackPort}`)
+    log(String(error))
+    process.exit(1)
+  }
+
+  log(`Listener-only mode active on http://127.0.0.1:${callbackPort}/oauth/callback`)
+
+  events.on('auth-code-received', async ({ code, state }: { code: string; state: string }) => {
+    let serverUrlHash = ''
+    try {
+      const stateParts = state.split(':')
+      if (stateParts.length !== 2 || !stateParts[0] || !stateParts[1]) {
+        throw new Error(`Invalid OAuth state format: ${state}`)
+      }
+      serverUrlHash = stateParts[1]
+      global.currentServerUrlHash = serverUrlHash
+
+      const authLock = await readAuthLock(serverUrlHash)
+      if (!authLock) {
+        throw new Error(`No auth lock found for ${serverUrlHash}`)
+      }
+      if (authLock.serverUrlHash !== serverUrlHash) {
+        throw new Error(`Auth lock hash mismatch for ${serverUrlHash}`)
+      }
+      if (authLock.state !== state) {
+        throw new Error(`Auth lock state mismatch for ${serverUrlHash}`)
+      }
+      if (!authLock.resource) {
+        throw new Error(`Auth lock missing resource for ${serverUrlHash}`)
+      }
+      if (isAuthLockStale(authLock.timestamp)) {
+        throw new Error(`Auth lock is stale for ${serverUrlHash}`)
+      }
+
+      const authProvider = await createAuthProvider(
+        serverUrl,
+        callbackPort,
+        headers,
+        host,
+        staticOAuthClientMetadata,
+        staticOAuthClientInfo,
+        authLock.resource,
+        serverUrlHash,
+      )
+      const transport = createTransport(serverUrl, headers, authProvider, transportStrategy)
+      log(`Processing OAuth callback for resource ${authLock.resource}`)
+      await transport.finishAuth(code)
+      await transport.close()
+      await deleteAuthLock(serverUrlHash)
+      log(`OAuth callback completed for resource ${authLock.resource}`)
+    } catch (error) {
+      log(`Error processing OAuth callback: ${error}`)
+      if (serverUrlHash) {
+        await deleteAuthLock(serverUrlHash)
+      }
+    }
+  })
+
+  setupSignalHandlers(async () => {
+    server.close()
+  })
+}
+
 async function runProxy(
   serverUrl: string,
   callbackPort: number,
+  callbackPortSpecified: boolean,
+  listenOnly: boolean,
   headers: Record<string, string>,
   transportStrategy: TransportStrategy = 'http-first',
   host: string,
@@ -41,139 +235,127 @@ async function runProxy(
   authTimeoutMs: number,
   serverUrlHash: string,
 ) {
-  // Set up event emitter for auth flow
-  const events = new EventEmitter()
-
-  // Create a lazy auth coordinator
-  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs)
-
-  // Discover OAuth server info via Protected Resource Metadata (RFC 9728)
-  // This probes the MCP server for WWW-Authenticate header and fetches PRM
-  log('Discovering OAuth server configuration...')
-  const discoveryResult = await discoverOAuthServerInfo(serverUrl, headers)
-
-  if (discoveryResult.protectedResourceMetadata) {
-    log(`Discovered authorization server: ${discoveryResult.authorizationServerUrl}`)
-    if (discoveryResult.protectedResourceMetadata.scopes_supported) {
-      debugLog('Protected Resource Metadata scopes', {
-        scopes_supported: discoveryResult.protectedResourceMetadata.scopes_supported,
-      })
-    }
-  } else {
-    debugLog('No Protected Resource Metadata found, using server URL as authorization server')
+  if (listenOnly) {
+    await runListenerOnly(
+      serverUrl,
+      callbackPort,
+      headers,
+      transportStrategy,
+      host,
+      staticOAuthClientMetadata,
+      staticOAuthClientInfo,
+      authTimeoutMs,
+    )
+    return
   }
 
-  // Create the OAuth client provider with discovered server info
-  const authProvider = new NodeOAuthClientProvider({
-    serverUrl: discoveryResult.authorizationServerUrl,
+  log(`Starting mcp-remote proxy ${MCP_REMOTE_VERSION} (local patched build)`)
+
+  const authProvider = await createAuthProvider(
+    serverUrl,
     callbackPort,
+    headers,
     host,
-    clientName: 'MCP CLI Proxy',
     staticOAuthClientMetadata,
     staticOAuthClientInfo,
     authorizeResource,
     serverUrlHash,
-    authorizationServerMetadata: discoveryResult.authorizationServerMetadata,
-    protectedResourceMetadata: discoveryResult.protectedResourceMetadata,
-    wwwAuthenticateScope: discoveryResult.wwwAuthenticateScope,
-  })
+  )
 
-  // Create the STDIO transport for local connections
   const localTransport = new StdioServerTransport()
+  let cleanupServer: any = null
 
-  // Keep track of the server instance for cleanup
-  let server: any = null
-
-  // Define an auth initializer function
   const authInitializer = async () => {
-    const authState = await authCoordinator.initializeAuth()
-
-    // Store server in outer scope for cleanup
-    server = authState.server
-
-    // If auth was completed by another instance, just log that we'll use the auth from disk
-    if (authState.skipBrowserAuth) {
-      log('Authentication was completed by another instance - will use tokens from disk')
-      // TODO: remove, the callback is happening before the tokens are exchanged
-      //  so we're slightly too early
-      await new Promise((res) => setTimeout(res, 1_000))
+    if (!callbackPortSpecified) {
+      const events = new EventEmitter()
+      const { server, waitForAuthCode } = setupOAuthCallbackServerWithLongPoll({
+        port: callbackPort,
+        path: '/oauth/callback',
+        events,
+        authTimeoutMs,
+      })
+      cleanupServer = server
+      return {
+        waitForAuthCode,
+        skipBrowserAuth: false,
+      }
     }
 
+    const existingLock = await readAuthLock(serverUrlHash)
+    if (existingLock && !isAuthLockStale(existingLock.timestamp)) {
+      log(`Authentication already in progress for resource ${existingLock.resource}`)
+      return {
+        waitForTokens: () => waitForTokens(authProvider),
+        skipBrowserAuth: true,
+      }
+    }
+
+    if (existingLock && isAuthLockStale(existingLock.timestamp)) {
+      log(`Warning: stale auth lock detected for resource ${existingLock.resource}. Replacing it.`)
+      await deleteAuthLock(serverUrlHash)
+    }
+
+    const state = authProvider.state()
+    await writeAuthLock(serverUrlHash, {
+      state,
+      serverUrlHash,
+      resource: authorizeResource || '',
+      timestamp: Date.now(),
+      status: 'pending',
+      pid: process.pid,
+      port: callbackPort,
+    })
+
+    log(
+      `Warning: fixed callback mode is enabled. Start a listener with --listen-only on 127.0.0.1:${callbackPort} before completing browser consent.`,
+    )
+
     return {
-      waitForAuthCode: authState.waitForAuthCode,
-      skipBrowserAuth: authState.skipBrowserAuth,
+      waitForTokens: () => waitForTokens(authProvider),
+      skipBrowserAuth: false,
     }
   }
 
   try {
-    // Connect to remote server with lazy authentication
     const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
 
-    // Set up bidirectional proxy between local and remote transports
     mcpProxy({
       transportToClient: localTransport,
       transportToServer: remoteTransport,
       ignoredTools,
     })
 
-    // Start the local STDIO server
     await localTransport.start()
     log('Local STDIO server running')
     log(`Proxy established successfully between local STDIO and remote ${remoteTransport.constructor.name}`)
     log('Press Ctrl+C to exit')
 
-    // Setup cleanup handler
-    const cleanup = async () => {
+    setupSignalHandlers(async () => {
       await remoteTransport.close()
       await localTransport.close()
-      // Only close the server if it was initialized
-      if (server) {
-        server.close()
+      if (cleanupServer) {
+        cleanupServer.close()
       }
-    }
-    setupSignalHandlers(cleanup)
+    })
   } catch (error) {
     log('Fatal error:', error)
-    if (error instanceof Error && error.message.includes('self-signed certificate in certificate chain')) {
-      log(`You may be behind a VPN!
-
-If you are behind a VPN, you can try setting the NODE_EXTRA_CA_CERTS environment variable to point
-to the CA certificate file. If using claude_desktop_config.json, this might look like:
-
-{
-  "mcpServers": {
-    "\${mcpServerName}": {
-      "command": "npx",
-      "args": [
-        "mcp-remote",
-        "https://remote.mcp.server/sse"
-      ],
-      "env": {
-        "NODE_EXTRA_CA_CERTS": "\${your CA certificate file path}.pem"
-      }
-    }
-  }
-}
-        `)
-    }
-    // Only close the server if it was initialized
-    if (server) {
-      server.close()
+    if (cleanupServer) {
+      cleanupServer.close()
     }
     process.exit(1)
   }
 }
 
-// Parse command-line arguments and run the proxy
 parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://server-url> [callback-port] [--debug]')
   .then(
     ({
       serverUrl,
       callbackPort,
+      callbackPortSpecified,
+      listenOnly,
       headers,
       transportStrategy,
       host,
-      debug,
       staticOAuthClientMetadata,
       staticOAuthClientInfo,
       authorizeResource,
@@ -184,6 +366,8 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
       return runProxy(
         serverUrl,
         callbackPort,
+        callbackPortSpecified,
+        listenOnly,
         headers,
         transportStrategy,
         host,

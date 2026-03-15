@@ -53,6 +53,8 @@ export interface OAuthCallbackServerOptions {
   events: EventEmitter
   /** Timeout in milliseconds for the auth callback server's long poll */
   authTimeoutMs?: number
+  /** When true, callback server only processes callbacks and does not expose long-poll endpoints */
+  listenOnly?: boolean
 }
 
 // optional tatic OAuth client information

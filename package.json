@@ -1,6 +1,6 @@
 {
   "name": "mcp-remote",
-  "version": "0.1.38",
+  "version": "0.1.38-codex.1",
   "description": "Remote proxy for Model Context Protocol, allowing local-only clients to connect to remote servers using oAuth",
   "keywords": [
     "mcp",
@@ -28,6 +28,7 @@
     "build:watch": "tsup --watch",
     "check": "prettier --check . && tsc",
     "lint-fix": "prettier --check . --write",
+    "install:fix": "npm run build && TARBALL=$(npm pack | tail -n 1) && mkdir -p \"$HOME/.mcp-auth\" && cp \"$TARBALL\" \"$HOME/.mcp-auth\"",
     "test:unit": "vitest run",
     "test:unit:watch": "vitest"
   },

@@ -17,50 +17,56 @@ import { log, MCP_REMOTE_VERSION } from './utils'
  *   - Format: OAuthClientInformation object with client_id and other registration details
  * - {server_hash}_tokens.json: Contains OAuth access and refresh tokens
  *   - Format: OAuthTokens object with access_token, refresh_token, and expiration information
- * - {server_hash}_code_verifier.txt: Contains the PKCE code verifier for the current OAuth flow
- *   - Format: Plain text string used for PKCE verification
+ * - {server_hash}_lock.json: Contains the active auth lock, including PKCE verifier and callback coordination state
+ *   - Format: JSON object with state, resource, codeVerifier, timestamps, and callback metadata
  *
  * All JSON files are stored with 2-space indentation for readability.
  */
 
 /**
- * Lockfile data structure
+ * Auth lock data structure
  */
-export interface LockfileData {
-  pid: number
-  port: number
+export interface AuthLockData {
+  state: string
+  serverUrlHash: string
+  resource: string
+  codeVerifier?: string
   timestamp: number
+  status: 'pending' | 'complete' | 'failed'
+  pid?: number
+  authorizationUrl?: string
+  port?: number
 }
 
 /**
- * Creates a lockfile for the given server
+ * Creates or updates an auth lock for the given server
  * @param serverUrlHash The hash of the server URL
- * @param pid The process ID
- * @param port The port the server is running on
+ * @param lockData The auth lock contents
  */
-export async function createLockfile(serverUrlHash: string, pid: number, port: number): Promise<void> {
-  const lockData: LockfileData = {
-    pid,
-    port,
-    timestamp: Date.now(),
-  }
+export async function writeAuthLock(serverUrlHash: string, lockData: AuthLockData): Promise<void> {
   await writeJsonFile(serverUrlHash, 'lock.json', lockData)
 }
 
 /**
- * Checks if a lockfile exists for the given server
+ * Reads the auth lock for the given server
  * @param serverUrlHash The hash of the server URL
- * @returns The lockfile data or null if it doesn't exist
+ * @returns The auth lock data or null if it doesn't exist
  */
-export async function checkLockfile(serverUrlHash: string): Promise<LockfileData | null> {
+export async function readAuthLock(serverUrlHash: string): Promise<AuthLockData | null> {
   try {
-    const lockfile = await readJsonFile<LockfileData>(serverUrlHash, 'lock.json', {
+    const lockfile = await readJsonFile<AuthLockData>(serverUrlHash, 'lock.json', {
       async parseAsync(data: any) {
         if (typeof data !== 'object' || data === null) return null
-        if (typeof data.pid !== 'number' || typeof data.port !== 'number' || typeof data.timestamp !== 'number') {
+        if (
+          typeof data.state !== 'string' ||
+          typeof data.serverUrlHash !== 'string' ||
+          typeof data.resource !== 'string' ||
+          typeof data.timestamp !== 'number' ||
+          typeof data.status !== 'string'
+        ) {
           return null
         }
-        return data as LockfileData
+        return data as AuthLockData
       },
     })
     return lockfile || null
@@ -70,10 +76,10 @@ export async function checkLockfile(serverUrlHash: string): Promise<LockfileData
 }
 
 /**
- * Deletes the lockfile for the given server
+ * Deletes the auth lock for the given server
  * @param serverUrlHash The hash of the server URL
  */
-export async function deleteLockfile(serverUrlHash: string): Promise<void> {
+export async function deleteAuthLock(serverUrlHash: string): Promise<void> {
   await deleteConfigFile(serverUrlHash, 'lock.json')
 }
 
