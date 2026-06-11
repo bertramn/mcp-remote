@@ -29,8 +29,10 @@ export interface OAuthProviderOptions {
   staticOAuthClientMetadata?: StaticOAuthClientMetadata
   /** Static OAuth client information to use instead of OAuth registration */
   staticOAuthClientInfo?: StaticOAuthClientInformationFull
-  /** Resource parameter to send to the authorization server */
+  /** Local resource discriminator for auth isolation and display naming */
   authorizeResource?: string
+  /** When true, send authorizeResource as the OAuth resource parameter */
+  sendResource?: boolean
   /** Pre-calculated server URL hash for cache isolation */
   serverUrlHash: string
   /** Authorization server metadata (optional, fetched if not provided) */

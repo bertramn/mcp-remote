@@ -112,6 +112,31 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(authUrl.searchParams.get('scope')).toBe('openid email profile')
     })
 
+    it('should not include resource parameter by default', async () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        authorizeResource: 'https://tenant.example.com/',
+      })
+
+      const authUrl = new URL('https://auth.example.com/authorize')
+      await provider.redirectToAuthorization(authUrl)
+
+      expect(authUrl.searchParams.has('resource')).toBe(false)
+    })
+
+    it('should include resource parameter when sendResource is true', async () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        authorizeResource: 'https://tenant.example.com/',
+        sendResource: true,
+      })
+
+      const authUrl = new URL('https://auth.example.com/authorize')
+      await provider.redirectToAuthorization(authUrl)
+
+      expect(authUrl.searchParams.get('resource')).toBe('https://tenant.example.com/')
+    })
+
     it('should not reopen the browser for the same pending auth state', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
@@ -137,6 +162,75 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       })
       expect(open).not.toHaveBeenCalled()
     })
+
+    it('should not reopen the browser when another process has a fresh pending auth lock', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const existingLock = {
+        state: 'other-state:test-hash',
+        serverUrlHash: 'test-hash',
+        resource: '',
+        timestamp: Date.now(),
+        status: 'pending' as const,
+        authorizationUrl: 'https://auth.example.com/authorize?existing=1',
+        port: 8080,
+      }
+
+      mockReadAuthLock.mockResolvedValue(existingLock)
+
+      const authUrl = new URL('https://auth.example.com/authorize?new=1')
+      await provider.redirectToAuthorization(authUrl)
+
+      expect(mockWriteAuthLock).not.toHaveBeenCalled()
+      expect(open).not.toHaveBeenCalled()
+    })
+
+    it('should replace stale pending auth locks from another process', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const existingLock = {
+        state: 'other-state:test-hash',
+        serverUrlHash: 'test-hash',
+        resource: '',
+        timestamp: Date.now() - 11 * 60 * 1000,
+        status: 'pending' as const,
+        authorizationUrl: 'https://auth.example.com/authorize?existing=1',
+        port: 8080,
+      }
+
+      mockReadAuthLock.mockResolvedValue(existingLock)
+
+      const authUrl = new URL('https://auth.example.com/authorize?new=1')
+      await provider.redirectToAuthorization(authUrl)
+
+      expect(mockWriteAuthLock).toHaveBeenCalledWith('test-hash', {
+        ...existingLock,
+        authorizationUrl: authUrl.toString(),
+        port: 8080,
+      })
+      expect(open).toHaveBeenCalled()
+    })
+  })
+
+  describe('resource indicator selection', () => {
+    it('should suppress SDK-selected resource indicator by default', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      const resourceUrl = await provider.validateResourceURL('https://mcp.lucid.app/mcp', 'https://mcp.lucid.app/mcp')
+
+      expect(resourceUrl).toBeUndefined()
+    })
+
+    it('should allow SDK-selected resource indicator when sendResource is true', async () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        sendResource: true,
+      })
+
+      const resourceUrl = await provider.validateResourceURL('https://mcp.lucid.app/mcp', 'https://mcp.lucid.app/mcp')
+
+      expect(resourceUrl?.href).toBe('https://mcp.lucid.app/mcp')
+    })
   })
 
   describe('code verifier reuse', () => {
@@ -156,6 +250,49 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       await provider.saveCodeVerifier('new-verifier')
 
       expect(mockWriteAuthLock).not.toHaveBeenCalled()
+    })
+
+    it('should not overwrite the verifier owned by another fresh pending auth state', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      mockReadAuthLock.mockResolvedValue({
+        state: 'other-state:test-hash',
+        serverUrlHash: 'test-hash',
+        resource: '',
+        timestamp: Date.now(),
+        status: 'pending' as const,
+        codeVerifier: 'existing-verifier',
+        port: 8080,
+      })
+
+      await provider.saveCodeVerifier('new-verifier')
+
+      expect(mockWriteAuthLock).not.toHaveBeenCalled()
+    })
+
+    it('should replace the verifier owned by a stale pending auth state', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      mockReadAuthLock.mockResolvedValue({
+        state: 'other-state:test-hash',
+        serverUrlHash: 'test-hash',
+        resource: '',
+        timestamp: Date.now() - 11 * 60 * 1000,
+        status: 'pending' as const,
+        codeVerifier: 'existing-verifier',
+        port: 8080,
+      })
+
+      await provider.saveCodeVerifier('new-verifier')
+
+      expect(mockWriteAuthLock).toHaveBeenCalledWith(
+        'test-hash',
+        expect.objectContaining({
+          state: provider.state(),
+          codeVerifier: 'new-verifier',
+          status: 'pending',
+        }),
+      )
     })
   })
 

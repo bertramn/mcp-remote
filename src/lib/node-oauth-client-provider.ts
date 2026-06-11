@@ -7,14 +7,7 @@ import {
   OAuthTokensSchema,
 } from '@modelcontextprotocol/sdk/shared/auth.js'
 import type { OAuthProviderOptions, StaticOAuthClientMetadata } from './types'
-import {
-  readJsonFile,
-  writeJsonFile,
-  deleteConfigFile,
-  readAuthLock,
-  writeAuthLock,
-  deleteAuthLock,
-} from './mcp-auth-config'
+import { readJsonFile, writeJsonFile, deleteConfigFile, readAuthLock, writeAuthLock, deleteAuthLock } from './mcp-auth-config'
 import { StaticOAuthClientInformationFull } from './types'
 import { log, debugLog, MCP_REMOTE_VERSION } from './utils'
 import { sanitizeUrl } from 'strict-url-sanitise'
@@ -23,8 +16,14 @@ import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } fr
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
 import type { AuthLockData } from './mcp-auth-config'
 
+const PENDING_AUTH_LOCK_TTL_MS = 10 * 60 * 1000
+
+function isFreshPendingAuthLock(lock: AuthLockData | null): lock is AuthLockData {
+  return !!lock && lock.status === 'pending' && Date.now() - lock.timestamp <= PENDING_AUTH_LOCK_TTL_MS
+}
+
 function isReusablePendingAuthLock(lock: AuthLockData | null, state: string): lock is AuthLockData {
-  return !!lock && lock.status === 'pending' && lock.state === state
+  return isFreshPendingAuthLock(lock) && lock.state === state
 }
 
 /**
@@ -41,6 +40,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private staticOAuthClientMetadata: StaticOAuthClientMetadata
   private staticOAuthClientInfo: StaticOAuthClientInformationFull
   private authorizeResource: string | undefined
+  private sendResource: boolean
   private _state: string
   private _clientInfo: OAuthClientInformationFull | undefined
   private authorizationServerMetadata: AuthorizationServerMetadata | undefined
@@ -61,6 +61,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     this.staticOAuthClientMetadata = options.staticOAuthClientMetadata
     this.staticOAuthClientInfo = options.staticOAuthClientInfo
     this.authorizeResource = options.authorizeResource
+    this.sendResource = options.sendResource || false
     this._state = `${randomUUID()}:${this.serverUrlHash}`
     this._clientInfo = undefined
     this.authorizationServerMetadata = options.authorizationServerMetadata
@@ -90,6 +91,20 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
   state(): string {
     return this._state
+  }
+
+  async validateResourceURL(serverUrl: string | URL, resource?: string): Promise<URL | undefined> {
+    if (!this.sendResource || !resource) {
+      return undefined
+    }
+
+    const requestedUrl = new URL(String(serverUrl))
+    const resourceUrl = new URL(resource)
+    if (requestedUrl.origin !== resourceUrl.origin) {
+      throw new Error(`Protected resource ${resource} does not match expected ${requestedUrl.origin}`)
+    }
+
+    return resourceUrl
   }
 
   /**
@@ -265,7 +280,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       // Ignore errors, metadata is optional
     })
 
-    if (this.authorizeResource) {
+    if (this.authorizeResource && this.sendResource) {
       authorizationUrl.searchParams.set('resource', this.authorizeResource)
     }
 
@@ -274,10 +289,13 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     debugLog('Added scope parameter to authorization URL', { scopes: effectiveScope })
 
     const existingLock = await readAuthLock(this.serverUrlHash)
-    const reuseExistingAuth = isReusablePendingAuthLock(existingLock, this._state) && !!existingLock.authorizationUrl
+    const sameStatePendingAuth = isReusablePendingAuthLock(existingLock, this._state)
+    const otherProcessPendingAuth = isFreshPendingAuthLock(existingLock) && existingLock.state !== this._state
+    const reuseExistingAuth = sameStatePendingAuth && !!existingLock.authorizationUrl
+    const skipBrowserOpen = reuseExistingAuth || otherProcessPendingAuth
     const authUrlToUse = reuseExistingAuth ? existingLock.authorizationUrl! : authorizationUrl.toString()
 
-    if (existingLock) {
+    if (existingLock && !otherProcessPendingAuth) {
       await writeAuthLock(this.serverUrlHash, {
         ...existingLock,
         authorizationUrl: authUrlToUse,
@@ -289,11 +307,12 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     debugLog('Redirecting to authorization URL', authUrlToUse)
 
-    if (reuseExistingAuth) {
+    if (skipBrowserOpen) {
       log('Authorization already pending. Reusing existing browser consent flow.')
       debugLog('Skipping browser reopen for existing pending auth lock', {
         serverUrlHash: this.serverUrlHash,
         state: this._state,
+        existingState: existingLock?.state,
       })
       return
     }
@@ -323,9 +342,19 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       return
     }
 
+    if (isFreshPendingAuthLock(existingLock) && existingLock.state !== this._state) {
+      debugLog('Another pending auth lock owns the code verifier, skipping overwrite', {
+        serverUrlHash: this.serverUrlHash,
+        state: this._state,
+        existingState: existingLock.state,
+      })
+      return
+    }
+
     await writeAuthLock(this.serverUrlHash, {
       state: this._state,
       serverUrlHash: this.serverUrlHash,
+      serverUrl: this.options.serverUrl,
       resource,
       timestamp: existingLock?.timestamp || Date.now(),
       status: 'pending',

@@ -18,6 +18,27 @@ describe('Feature: Command Line Arguments Parsing', () => {
     // Then the server URL should be correctly extracted
     expect(result.serverUrl).toBe('https://example.com/sse')
     expect(typeof result.serverUrl).toBe('string')
+    expect(result.sendResource).toBe(false)
+  })
+
+  it('Scenario: Parse send-resource flag as false by default', async () => {
+    const args = ['https://example.com/sse', '--resource', 'https://tenant.example.com/']
+    const usage = 'test usage'
+
+    const result = await parseCommandLineArgs(args, usage)
+
+    expect(result.authorizeResource).toBe('https://tenant.example.com/')
+    expect(result.sendResource).toBe(false)
+  })
+
+  it('Scenario: Parse send-resource flag when present', async () => {
+    const args = ['https://example.com/sse', '--resource', 'https://tenant.example.com/', '--send-resource']
+    const usage = 'test usage'
+
+    const result = await parseCommandLineArgs(args, usage)
+
+    expect(result.authorizeResource).toBe('https://tenant.example.com/')
+    expect(result.sendResource).toBe(true)
   })
 
   it('Scenario: Parse server URL with callback port', async () => {

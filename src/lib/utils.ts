@@ -603,42 +603,42 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
   // Long-polling endpoint
   if (!options.listenOnly) {
     app.get('/wait-for-auth', (req, res) => {
-    if (authCode) {
-      // Auth already completed - just return 200 without the actual code
-      // Secondary instances will read tokens from disk
-      log('Auth already completed, returning 200')
-      res.status(200).send('Authentication completed')
-      return
-    }
+      if (authCode) {
+        // Auth already completed - just return 200 without the actual code
+        // Secondary instances will read tokens from disk
+        log('Auth already completed, returning 200')
+        res.status(200).send('Authentication completed')
+        return
+      }
 
-    if (req.query.poll === 'false') {
-      log('Client requested no long poll, responding with 202')
-      res.status(202).send('Authentication in progress')
-      return
-    }
+      if (req.query.poll === 'false') {
+        log('Client requested no long poll, responding with 202')
+        res.status(202).send('Authentication in progress')
+        return
+      }
 
-    // Long poll - wait for up to 30 seconds
-    const longPollTimeout = setTimeout(() => {
-      log('Long poll timeout reached, responding with 202')
-      res.status(202).send('Authentication in progress')
-    }, options.authTimeoutMs || 30000)
+      // Long poll - wait for up to 30 seconds
+      const longPollTimeout = setTimeout(() => {
+        log('Long poll timeout reached, responding with 202')
+        res.status(202).send('Authentication in progress')
+      }, options.authTimeoutMs || 30000)
 
-    // If auth completes while we're waiting, send the response immediately
-    authCompletedPromise
-      .then(() => {
-        clearTimeout(longPollTimeout)
-        if (!res.headersSent) {
-          log('Auth completed during long poll, responding with 200')
-          res.status(200).send('Authentication completed')
-        }
-      })
-      .catch(() => {
-        clearTimeout(longPollTimeout)
-        if (!res.headersSent) {
-          log('Auth failed during long poll, responding with 500')
-          res.status(500).send('Authentication failed')
-        }
-      })
+      // If auth completes while we're waiting, send the response immediately
+      authCompletedPromise
+        .then(() => {
+          clearTimeout(longPollTimeout)
+          if (!res.headersSent) {
+            log('Auth completed during long poll, responding with 200')
+            res.status(200).send('Authentication completed')
+          }
+        })
+        .catch(() => {
+          clearTimeout(longPollTimeout)
+          if (!res.headersSent) {
+            log('Auth failed during long poll, responding with 500')
+            res.status(500).send('Authentication failed')
+          }
+        })
     })
   }
 
@@ -877,6 +877,11 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     log(`Using authorize resource: ${authorizeResource}`)
   }
 
+  const sendResource = args.includes('--send-resource')
+  if (sendResource) {
+    log(`Send OAuth resource parameter: ${sendResource}`)
+  }
+
   // Parse ignored tools
   const ignoredTools: string[] = []
   let j = 0
@@ -980,6 +985,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     staticOAuthClientMetadata,
     staticOAuthClientInfo,
     authorizeResource,
+    sendResource,
     ignoredTools,
     authTimeoutMs,
     serverUrlHash,
@@ -1011,12 +1017,12 @@ export function setupSignalHandlers(cleanup: () => Promise<void>) {
  * Includes resource and headers to isolate OAuth sessions per unique
  * server configuration (fixes #25: multi-instance support)
  * @param serverUrl The server URL
- * @param authorizeResource Optional resource parameter for OAuth
+ * @param authorizeResource Optional local resource discriminator
  * @param headers Optional custom headers
  * @returns MD5 hash of the configuration
  */
 export function getServerUrlHash(serverUrl: string, authorizeResource?: string, headers?: Record<string, string>): string {
-  // Include resource and headers in hash to isolate OAuth sessions
+  // Include local resource discriminator and headers in hash to isolate OAuth sessions
   // per unique server configuration (fixes #25)
   const parts = [serverUrl]
   if (authorizeResource) parts.push(authorizeResource)

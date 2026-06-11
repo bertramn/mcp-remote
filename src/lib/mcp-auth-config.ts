@@ -29,6 +29,7 @@ import { log, MCP_REMOTE_VERSION } from './utils'
 export interface AuthLockData {
   state: string
   serverUrlHash: string
+  serverUrl?: string
   resource: string
   codeVerifier?: string
   timestamp: number

@@ -72,6 +72,7 @@ async function createAuthProvider(
   staticOAuthClientMetadata: StaticOAuthClientMetadata,
   staticOAuthClientInfo: StaticOAuthClientInformationFull,
   authorizeResource: string,
+  sendResource: boolean,
   serverUrlHash: string,
 ) {
   log('Discovering OAuth server configuration...')
@@ -91,6 +92,7 @@ async function createAuthProvider(
     staticOAuthClientMetadata,
     staticOAuthClientInfo,
     authorizeResource,
+    sendResource,
     serverUrlHash,
     authorizationServerMetadata: discoveryResult.authorizationServerMetadata,
     protectedResourceMetadata: discoveryResult.protectedResourceMetadata,
@@ -191,17 +193,19 @@ async function runListenerOnly(
         throw new Error(`Auth lock is stale for ${serverUrlHash}`)
       }
 
+      const callbackServerUrl = authLock.serverUrl || serverUrl
       const authProvider = await createAuthProvider(
-        serverUrl,
+        callbackServerUrl,
         callbackPort,
         headers,
         host,
         staticOAuthClientMetadata,
         staticOAuthClientInfo,
         authLock.resource,
+        false,
         serverUrlHash,
       )
-      const transport = createTransport(serverUrl, headers, authProvider, transportStrategy)
+      const transport = createTransport(callbackServerUrl, headers, authProvider, transportStrategy)
       log(`Processing OAuth callback for resource ${authLock.resource}`)
       await transport.finishAuth(code)
       await transport.close()
@@ -231,6 +235,7 @@ async function runProxy(
   staticOAuthClientMetadata: StaticOAuthClientMetadata,
   staticOAuthClientInfo: StaticOAuthClientInformationFull,
   authorizeResource: string,
+  sendResource: boolean,
   ignoredTools: string[],
   authTimeoutMs: number,
   serverUrlHash: string,
@@ -259,6 +264,7 @@ async function runProxy(
     staticOAuthClientMetadata,
     staticOAuthClientInfo,
     authorizeResource,
+    sendResource,
     serverUrlHash,
   )
 
@@ -299,6 +305,7 @@ async function runProxy(
     await writeAuthLock(serverUrlHash, {
       state,
       serverUrlHash,
+      serverUrl,
       resource: authorizeResource || '',
       timestamp: Date.now(),
       status: 'pending',
@@ -359,6 +366,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
       staticOAuthClientMetadata,
       staticOAuthClientInfo,
       authorizeResource,
+      sendResource,
       ignoredTools,
       authTimeoutMs,
       serverUrlHash,
@@ -374,6 +382,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
         staticOAuthClientMetadata,
         staticOAuthClientInfo,
         authorizeResource,
+        sendResource,
         ignoredTools,
         authTimeoutMs,
         serverUrlHash,
