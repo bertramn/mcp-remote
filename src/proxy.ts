@@ -11,7 +11,8 @@
 
 import { EventEmitter } from 'events'
 import type { Server } from 'http'
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import net from 'net'
+import { pathToFileURL } from 'url'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import {
@@ -28,11 +29,32 @@ import {
 } from './lib/utils'
 import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
-import { deleteAuthLock, readAuthLock, writeAuthLock } from './lib/mcp-auth-config'
+import { FlexibleStdioServerTransport } from './lib/flexible-stdio-server-transport'
+import { waitForTokens } from './lib/proxy-auth'
+import { claimAuthLock, deleteAuthLockIfStateMatches, markAuthLockStatusIfStateMatches, readAuthLock } from './lib/mcp-auth-config'
 
 const AUTH_LOCK_TTL_MS = 10 * 60 * 1000
-const TOKEN_WAIT_TIMEOUT_MS = 10 * 60 * 1000
-const TOKEN_WAIT_POLL_MS = 3000
+
+type ProxyAuthModeOptions = {
+  splitCallbackMode: boolean
+  callbackPort: number
+  authTimeoutMs: number
+  authProvider: NodeOAuthClientProvider
+  serverUrlHash: string
+  serverUrl: string
+  authorizeResource: string
+  listenerReachable?: (callbackPort: number) => Promise<void>
+  setupCallbackServer?: typeof setupOAuthCallbackServerWithLongPoll
+}
+
+type ProxyAuthMode = {
+  cleanupServer: Server | null
+  authInitializer: () => Promise<{
+    waitForAuthCode?: () => Promise<string>
+    waitForTokens?: () => Promise<void>
+    skipBrowserAuth: boolean
+  }>
+}
 
 function getClientName(authorizeResource: string): string {
   if (!authorizeResource) {
@@ -50,18 +72,6 @@ function getClientName(authorizeResource: string): string {
 
 function isAuthLockStale(timestamp: number): boolean {
   return Date.now() - timestamp > AUTH_LOCK_TTL_MS
-}
-
-async function waitForTokens(authProvider: NodeOAuthClientProvider): Promise<void> {
-  const startedAt = Date.now()
-  while (Date.now() - startedAt < TOKEN_WAIT_TIMEOUT_MS) {
-    const tokens = await authProvider.tokens()
-    if (tokens?.access_token) {
-      return
-    }
-    await new Promise((resolve) => setTimeout(resolve, TOKEN_WAIT_POLL_MS))
-  }
-  throw new Error('Timed out waiting for shared token exchange to complete')
 }
 
 async function createAuthProvider(
@@ -135,6 +145,116 @@ async function waitForServerListening(server: Server): Promise<void> {
   })
 }
 
+async function waitForCallbackListener(callbackPort: number): Promise<void> {
+  const response = await fetch(`http://127.0.0.1:${callbackPort}/oauth/callback`, {
+    method: 'GET',
+    redirect: 'manual',
+  }).catch(() => undefined)
+
+  if (response && response.status < 500) {
+    return
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port: callbackPort })
+    socket.once('connect', () => {
+      socket.destroy()
+      resolve()
+    })
+    socket.once('error', (error) => {
+      socket.destroy()
+      reject(error)
+    })
+  })
+}
+
+export async function prepareProxyAuthMode({
+  splitCallbackMode,
+  callbackPort,
+  authTimeoutMs,
+  authProvider,
+  serverUrlHash,
+  serverUrl,
+  authorizeResource,
+  listenerReachable = waitForCallbackListener,
+  setupCallbackServer = setupOAuthCallbackServerWithLongPoll,
+}: ProxyAuthModeOptions): Promise<ProxyAuthMode> {
+  let cleanupServer: Server | null = null
+  let waitForAuthCode: (() => Promise<string>) | undefined
+
+  if (splitCallbackMode) {
+    try {
+      await listenerReachable(callbackPort)
+    } catch (error) {
+      log(`Fatal error: no callback listener is reachable on 127.0.0.1:${callbackPort}`)
+      log(`Start one with --listen-only before starting browser authorization.`)
+      throw error
+    }
+  } else {
+    const events = new EventEmitter()
+    const callbackServer = setupCallbackServer({
+      port: callbackPort,
+      path: '/oauth/callback',
+      events,
+      authTimeoutMs,
+    })
+    cleanupServer = callbackServer.server
+    waitForAuthCode = callbackServer.waitForAuthCode
+    try {
+      await waitForServerListening(callbackServer.server)
+    } catch (error) {
+      log(`Fatal error: cannot bind callback port ${callbackPort}`)
+      throw error
+    }
+  }
+
+  return {
+    cleanupServer,
+    authInitializer: async () => {
+      if (!splitCallbackMode) {
+        if (!waitForAuthCode) {
+          throw new Error('OAuth callback listener was not initialized')
+        }
+        return {
+          waitForAuthCode,
+          skipBrowserAuth: false,
+        }
+      }
+
+      const state = authProvider.state()
+      const claimResult = await claimAuthLock(serverUrlHash, {
+        state,
+        serverUrlHash,
+        serverUrl,
+        resource: authorizeResource || serverUrl,
+        timestamp: Date.now(),
+        status: 'pending',
+        pid: process.pid,
+        port: callbackPort,
+      })
+
+      if (claimResult.role === 'waiter') {
+        log(`Authentication already in progress for resource ${claimResult.lock.resource}`)
+        return {
+          waitForTokens: () => waitForTokens(authProvider, serverUrlHash, claimResult.lock.timestamp, claimResult.lock.state),
+          skipBrowserAuth: true,
+        }
+      }
+
+      if (claimResult.replacedStaleLock) {
+        log(`Warning: stale auth lock detected for resource ${claimResult.replacedStaleLock.resource}. Replacing it.`)
+      }
+
+      log(`Split callback mode is enabled. Using listener on 127.0.0.1:${callbackPort} for browser consent.`)
+
+      return {
+        waitForTokens: () => waitForTokens(authProvider, serverUrlHash, claimResult.lock.timestamp, claimResult.lock.state),
+        skipBrowserAuth: false,
+      }
+    },
+  }
+}
+
 async function runListenerOnly(
   serverUrl: string,
   callbackPort: number,
@@ -145,7 +265,7 @@ async function runListenerOnly(
   staticOAuthClientInfo: StaticOAuthClientInformationFull,
   authTimeoutMs: number,
 ) {
-  log(`Starting mcp-remote proxy ${MCP_REMOTE_VERSION} (local patched build)`)
+  log(`Starting mcp-remote proxy ${MCP_REMOTE_VERSION}`)
 
   const events = new EventEmitter()
   const { server } = setupOAuthCallbackServerWithLongPoll({
@@ -186,14 +306,15 @@ async function runListenerOnly(
       if (authLock.state !== state) {
         throw new Error(`Auth lock state mismatch for ${serverUrlHash}`)
       }
-      if (!authLock.resource) {
-        throw new Error(`Auth lock missing resource for ${serverUrlHash}`)
+      if (!authLock.codeVerifier) {
+        throw new Error(`Auth lock missing code verifier for ${serverUrlHash}`)
       }
       if (isAuthLockStale(authLock.timestamp)) {
         throw new Error(`Auth lock is stale for ${serverUrlHash}`)
       }
 
       const callbackServerUrl = authLock.serverUrl || serverUrl
+      const callbackResource = authLock.resource || callbackServerUrl
       const authProvider = await createAuthProvider(
         callbackServerUrl,
         callbackPort,
@@ -201,27 +322,33 @@ async function runListenerOnly(
         host,
         staticOAuthClientMetadata,
         staticOAuthClientInfo,
-        authLock.resource,
+        callbackResource,
         false,
         serverUrlHash,
       )
+      authProvider.setAuthLockState(authLock.state)
       const transport = createTransport(callbackServerUrl, headers, authProvider, transportStrategy)
-      log(`Processing OAuth callback for resource ${authLock.resource}`)
+      log(`Processing OAuth callback for resource ${callbackResource}`)
       await transport.finishAuth(code)
       await transport.close()
-      await deleteAuthLock(serverUrlHash)
-      log(`OAuth callback completed for resource ${authLock.resource}`)
+      await deleteAuthLockIfStateMatches(serverUrlHash, state)
+      log(`OAuth callback completed for resource ${callbackResource}`)
     } catch (error) {
       log(`Error processing OAuth callback: ${error}`)
       if (serverUrlHash) {
-        await deleteAuthLock(serverUrlHash)
+        await markAuthLockStatusIfStateMatches(serverUrlHash, state, 'failed')
       }
     }
   })
 
-  setupSignalHandlers(async () => {
-    server.close()
-  })
+  setupSignalHandlers(
+    async () => {
+      server.close()
+    },
+    {
+      shutdownOnStdinEnd: false,
+    },
+  )
 }
 
 async function runProxy(
@@ -254,7 +381,7 @@ async function runProxy(
     return
   }
 
-  log(`Starting mcp-remote proxy ${MCP_REMOTE_VERSION} (local patched build)`)
+  log(`Starting mcp-remote proxy ${MCP_REMOTE_VERSION}`)
 
   const authProvider = await createAuthProvider(
     serverUrl,
@@ -268,63 +395,21 @@ async function runProxy(
     serverUrlHash,
   )
 
-  const localTransport = new StdioServerTransport()
-  let cleanupServer: any = null
-
-  const authInitializer = async () => {
-    if (!callbackPortSpecified) {
-      const events = new EventEmitter()
-      const { server, waitForAuthCode } = setupOAuthCallbackServerWithLongPoll({
-        port: callbackPort,
-        path: '/oauth/callback',
-        events,
-        authTimeoutMs,
-      })
-      cleanupServer = server
-      return {
-        waitForAuthCode,
-        skipBrowserAuth: false,
-      }
-    }
-
-    const existingLock = await readAuthLock(serverUrlHash)
-    if (existingLock && !isAuthLockStale(existingLock.timestamp)) {
-      log(`Authentication already in progress for resource ${existingLock.resource}`)
-      return {
-        waitForTokens: () => waitForTokens(authProvider),
-        skipBrowserAuth: true,
-      }
-    }
-
-    if (existingLock && isAuthLockStale(existingLock.timestamp)) {
-      log(`Warning: stale auth lock detected for resource ${existingLock.resource}. Replacing it.`)
-      await deleteAuthLock(serverUrlHash)
-    }
-
-    const state = authProvider.state()
-    await writeAuthLock(serverUrlHash, {
-      state,
-      serverUrlHash,
-      serverUrl,
-      resource: authorizeResource || '',
-      timestamp: Date.now(),
-      status: 'pending',
-      pid: process.pid,
-      port: callbackPort,
-    })
-
-    log(
-      `Warning: fixed callback mode is enabled. Start a listener with --listen-only on 127.0.0.1:${callbackPort} before completing browser consent.`,
-    )
-
-    return {
-      waitForTokens: () => waitForTokens(authProvider),
-      skipBrowserAuth: false,
-    }
-  }
+  const localTransport = new FlexibleStdioServerTransport()
+  let cleanupServer: Server | null = null
 
   try {
-    const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authInitializer, transportStrategy)
+    const authMode = await prepareProxyAuthMode({
+      splitCallbackMode: callbackPortSpecified,
+      callbackPort,
+      authTimeoutMs,
+      authProvider,
+      serverUrlHash,
+      serverUrl,
+      authorizeResource,
+    })
+    cleanupServer = authMode.cleanupServer
+    const remoteTransport = await connectToRemoteServer(null, serverUrl, authProvider, headers, authMode.authInitializer, transportStrategy)
 
     mcpProxy({
       transportToClient: localTransport,
@@ -353,43 +438,45 @@ async function runProxy(
   }
 }
 
-parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://server-url> [callback-port] [--debug]')
-  .then(
-    ({
-      serverUrl,
-      callbackPort,
-      callbackPortSpecified,
-      listenOnly,
-      headers,
-      transportStrategy,
-      host,
-      staticOAuthClientMetadata,
-      staticOAuthClientInfo,
-      authorizeResource,
-      sendResource,
-      ignoredTools,
-      authTimeoutMs,
-      serverUrlHash,
-    }) => {
-      return runProxy(
-        serverUrl,
-        callbackPort,
-        callbackPortSpecified,
-        listenOnly,
-        headers,
-        transportStrategy,
-        host,
-        staticOAuthClientMetadata,
-        staticOAuthClientInfo,
-        authorizeResource,
-        sendResource,
-        ignoredTools,
-        authTimeoutMs,
-        serverUrlHash,
-      )
-    },
+async function main() {
+  const {
+    serverUrl,
+    callbackPort,
+    callbackPortSpecified,
+    listenOnly,
+    headers,
+    transportStrategy,
+    host,
+    staticOAuthClientMetadata,
+    staticOAuthClientInfo,
+    authorizeResource,
+    sendResource,
+    ignoredTools,
+    authTimeoutMs,
+    serverUrlHash,
+  } = await parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://server-url> [callback-port] [--debug]')
+
+  await runProxy(
+    serverUrl,
+    callbackPort,
+    callbackPortSpecified,
+    listenOnly,
+    headers,
+    transportStrategy,
+    host,
+    staticOAuthClientMetadata,
+    staticOAuthClientInfo,
+    authorizeResource,
+    sendResource,
+    ignoredTools,
+    authTimeoutMs,
+    serverUrlHash,
   )
-  .catch((error) => {
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
     log('Fatal error:', error)
     process.exit(1)
   })
+}

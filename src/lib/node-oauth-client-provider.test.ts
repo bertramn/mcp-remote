@@ -24,7 +24,9 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
   let mockWriteJsonFile: any
   let mockDeleteConfigFile: any
   let mockReadAuthLock: any
-  let mockWriteAuthLock: any
+  let mockClaimAuthLock: any
+  let mockUpdateAuthLockIfStateMatches: any
+  let mockDeleteAuthLockIfStateMatches: any
 
   const defaultOptions: OAuthProviderOptions = {
     serverUrl: 'https://example.com',
@@ -38,13 +40,19 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     mockWriteJsonFile = vi.mocked(mcpAuthConfig.writeJsonFile)
     mockDeleteConfigFile = vi.mocked(mcpAuthConfig.deleteConfigFile)
     mockReadAuthLock = vi.mocked(mcpAuthConfig.readAuthLock)
-    mockWriteAuthLock = vi.mocked(mcpAuthConfig.writeAuthLock)
+    mockClaimAuthLock = vi.mocked(mcpAuthConfig.claimAuthLock)
+    mockUpdateAuthLockIfStateMatches = vi.mocked(mcpAuthConfig.updateAuthLockIfStateMatches)
+    mockDeleteAuthLockIfStateMatches = vi.mocked(mcpAuthConfig.deleteAuthLockIfStateMatches)
 
     mockReadJsonFile.mockResolvedValue(undefined)
     mockWriteJsonFile.mockResolvedValue(undefined)
     mockDeleteConfigFile.mockResolvedValue(undefined)
     mockReadAuthLock.mockResolvedValue(null)
-    mockWriteAuthLock.mockResolvedValue(undefined)
+    mockClaimAuthLock.mockImplementation((_serverUrlHash: string, lockData: any) =>
+      Promise.resolve({ role: 'owner', lock: lockData, created: true }),
+    )
+    mockUpdateAuthLockIfStateMatches.mockResolvedValue(true)
+    mockDeleteAuthLockIfStateMatches.mockResolvedValue(true)
   })
 
   afterEach(() => {
@@ -150,16 +158,16 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
         port: 8080,
       }
 
-      mockReadAuthLock.mockResolvedValue(existingLock)
+      mockClaimAuthLock.mockResolvedValue({
+        role: 'owner',
+        lock: existingLock,
+        created: false,
+      })
 
       const authUrl = new URL('https://auth.example.com/authorize?new=1')
       await provider.redirectToAuthorization(authUrl)
 
-      expect(mockWriteAuthLock).toHaveBeenCalledWith('test-hash', {
-        ...existingLock,
-        authorizationUrl: 'https://auth.example.com/authorize?existing=1',
-        port: 8080,
-      })
+      expect(mockUpdateAuthLockIfStateMatches).not.toHaveBeenCalled()
       expect(open).not.toHaveBeenCalled()
     })
 
@@ -176,12 +184,15 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
         port: 8080,
       }
 
-      mockReadAuthLock.mockResolvedValue(existingLock)
+      mockClaimAuthLock.mockResolvedValue({
+        role: 'waiter',
+        lock: existingLock,
+      })
 
       const authUrl = new URL('https://auth.example.com/authorize?new=1')
       await provider.redirectToAuthorization(authUrl)
 
-      expect(mockWriteAuthLock).not.toHaveBeenCalled()
+      expect(mockUpdateAuthLockIfStateMatches).not.toHaveBeenCalled()
       expect(open).not.toHaveBeenCalled()
     })
 
@@ -198,13 +209,24 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
         port: 8080,
       }
 
-      mockReadAuthLock.mockResolvedValue(existingLock)
+      mockClaimAuthLock.mockResolvedValue({
+        role: 'owner',
+        lock: {
+          state: provider.state(),
+          serverUrlHash: 'test-hash',
+          resource: '',
+          timestamp: Date.now(),
+          status: 'pending' as const,
+          port: 8080,
+        },
+        created: true,
+        replacedStaleLock: existingLock,
+      })
 
       const authUrl = new URL('https://auth.example.com/authorize?new=1')
       await provider.redirectToAuthorization(authUrl)
 
-      expect(mockWriteAuthLock).toHaveBeenCalledWith('test-hash', {
-        ...existingLock,
+      expect(mockUpdateAuthLockIfStateMatches).toHaveBeenCalledWith('test-hash', provider.state(), {
         authorizationUrl: authUrl.toString(),
         port: 8080,
       })
@@ -237,7 +259,7 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
     it('should not overwrite the verifier for the same pending auth state', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
-      mockReadAuthLock.mockResolvedValue({
+      const existingLock = {
         state: provider.state(),
         serverUrlHash: 'test-hash',
         resource: '',
@@ -245,54 +267,96 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
         status: 'pending' as const,
         codeVerifier: 'existing-verifier',
         port: 8080,
+      }
+      mockClaimAuthLock.mockResolvedValue({
+        role: 'owner',
+        lock: existingLock,
+        created: false,
       })
 
       await provider.saveCodeVerifier('new-verifier')
 
-      expect(mockWriteAuthLock).not.toHaveBeenCalled()
+      expect(mockUpdateAuthLockIfStateMatches).not.toHaveBeenCalled()
     })
 
     it('should not overwrite the verifier owned by another fresh pending auth state', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
-      mockReadAuthLock.mockResolvedValue({
-        state: 'other-state:test-hash',
-        serverUrlHash: 'test-hash',
-        resource: '',
-        timestamp: Date.now(),
-        status: 'pending' as const,
-        codeVerifier: 'existing-verifier',
-        port: 8080,
+      mockClaimAuthLock.mockResolvedValue({
+        role: 'waiter',
+        lock: {
+          state: 'other-state:test-hash',
+          serverUrlHash: 'test-hash',
+          resource: '',
+          timestamp: Date.now(),
+          status: 'pending' as const,
+          codeVerifier: 'existing-verifier',
+          port: 8080,
+        },
       })
 
       await provider.saveCodeVerifier('new-verifier')
 
-      expect(mockWriteAuthLock).not.toHaveBeenCalled()
+      expect(mockUpdateAuthLockIfStateMatches).not.toHaveBeenCalled()
+    })
+
+    it('does not overwrite auth URL or verifier when it is a waiter', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      mockClaimAuthLock.mockResolvedValue({
+        role: 'waiter',
+        lock: {
+          state: 'other-state:test-hash',
+          serverUrlHash: 'test-hash',
+          resource: '',
+          timestamp: Date.now(),
+          status: 'pending' as const,
+          codeVerifier: 'existing-verifier',
+          authorizationUrl: 'https://auth.example.com/authorize?owner=1',
+          port: 8080,
+        },
+      })
+
+      await provider.saveCodeVerifier('new-verifier')
+      await provider.redirectToAuthorization(new URL('https://auth.example.com/authorize?waiter=1'))
+
+      expect(mockUpdateAuthLockIfStateMatches).not.toHaveBeenCalled()
+      expect(open).not.toHaveBeenCalled()
     })
 
     it('should replace the verifier owned by a stale pending auth state', async () => {
       provider = new NodeOAuthClientProvider(defaultOptions)
 
-      mockReadAuthLock.mockResolvedValue({
-        state: 'other-state:test-hash',
-        serverUrlHash: 'test-hash',
-        resource: '',
-        timestamp: Date.now() - 11 * 60 * 1000,
-        status: 'pending' as const,
-        codeVerifier: 'existing-verifier',
-        port: 8080,
+      const staleTimestamp = Date.now() - 11 * 60 * 1000
+      mockClaimAuthLock.mockResolvedValue({
+        role: 'owner',
+        lock: {
+          state: provider.state(),
+          serverUrlHash: 'test-hash',
+          resource: '',
+          timestamp: Date.now(),
+          status: 'pending' as const,
+          port: 8080,
+        },
+        created: true,
+        replacedStaleLock: {
+          state: 'other-state:test-hash',
+          serverUrlHash: 'test-hash',
+          resource: '',
+          timestamp: staleTimestamp,
+          status: 'pending' as const,
+          codeVerifier: 'existing-verifier',
+          authorizationUrl: 'https://auth.example.com/authorize?stale=1',
+          port: 8080,
+        },
       })
 
       await provider.saveCodeVerifier('new-verifier')
 
-      expect(mockWriteAuthLock).toHaveBeenCalledWith(
-        'test-hash',
-        expect.objectContaining({
-          state: provider.state(),
-          codeVerifier: 'new-verifier',
-          status: 'pending',
-        }),
-      )
+      expect(mockUpdateAuthLockIfStateMatches).toHaveBeenCalledWith('test-hash', provider.state(), {
+        codeVerifier: 'new-verifier',
+        port: 8080,
+      })
     })
   })
 

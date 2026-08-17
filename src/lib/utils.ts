@@ -41,6 +41,25 @@ const pid = process.pid
 export let DEBUG = false
 export let SILENT = false
 
+const SENSITIVE_HEADER_NAME_PARTS = ['authorization', 'cookie', 'token', 'secret', 'api-key', 'apikey', 'x-api-key', 'key']
+
+function isSensitiveHeaderName(headerName: string): boolean {
+  const normalized = headerName.toLowerCase()
+  return SENSITIVE_HEADER_NAME_PARTS.some((part) => normalized.includes(part))
+}
+
+function fingerprintHeaderValue(value: string): string {
+  return `sha256:${crypto.createHash('sha256').update(value).digest('hex').slice(0, 16)}`
+}
+
+function redactHeadersForLog(headers: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, isSensitiveHeaderName(key) ? '[redacted]' : value]))
+}
+
+function fingerprintHeadersForHash(headers: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, fingerprintHeaderValue(value)]))
+}
+
 // Helper function for timestamp formatting
 function getTimestamp(): string {
   const now = new Date()
@@ -455,7 +474,12 @@ export async function connectToRemoteServer(
         debugLog('Creating test transport for HTTP-only connection test')
         const testTransport = new StreamableHTTPClientTransport(url, { authProvider, requestInit: { headers } })
         const testClient = new Client({ name: 'mcp-remote-fallback-test', version: '0.0.0' }, { capabilities: {} })
-        await testClient.connect(testTransport)
+        try {
+          await testClient.connect(testTransport)
+        } finally {
+          await testClient.close().catch(() => undefined)
+          await testTransport.close().catch(() => undefined)
+        }
       }
     }
     log(`Connected to remote server using ${transport.constructor.name}`)
@@ -661,7 +685,7 @@ export function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbackServe
     authCompletedResolve(code)
 
     res.send(`
-      Authorization successful!
+      Authorization code received.
       You may close this window and return to the CLI.
       <script>
         // If this is a non-interactive session (no manual approval step was required) then
@@ -923,7 +947,24 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     log(usage)
     process.exit(1)
   }
-  // Calculate hash with all parsed parameters for cache isolation
+  // Replace environment variables in headers
+  // example `Authorization: Bearer ${TOKEN}` will read process.env.TOKEN
+  for (const [key, value] of Object.entries(headers)) {
+    headers[key] = value.replace(/\$\{([^}]+)}/g, (match, envVarName) => {
+      const envVarValue = process.env[envVarName]
+
+      if (envVarValue !== undefined) {
+        log(`Replacing ${match} with environment value in header '${key}'`)
+        return envVarValue
+      } else {
+        log(`Warning: Environment variable '${envVarName}' not found for header '${key}'.`)
+        return ''
+      }
+    })
+  }
+
+  // Calculate hash after environment substitution. Header values are
+  // fingerprinted inside getServerUrlHash so raw secrets never enter the hash input.
   const serverUrlHash = getServerUrlHash(serverUrl, authorizeResource, headers)
 
   // Set server hash globally for debug logging
@@ -955,22 +996,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   }
 
   if (Object.keys(headers).length > 0) {
-    log(`Using custom headers: ${JSON.stringify(headers)}`)
-  }
-  // Replace environment variables in headers
-  // example `Authorization: Bearer ${TOKEN}` will read process.env.TOKEN
-  for (const [key, value] of Object.entries(headers)) {
-    headers[key] = value.replace(/\$\{([^}]+)}/g, (match, envVarName) => {
-      const envVarValue = process.env[envVarName]
-
-      if (envVarValue !== undefined) {
-        log(`Replacing ${match} with environment value in header '${key}'`)
-        return envVarValue
-      } else {
-        log(`Warning: Environment variable '${envVarName}' not found for header '${key}'.`)
-        return ''
-      }
-    })
+    log(`Using custom headers: ${JSON.stringify(redactHeadersForLog(headers))}`)
   }
 
   return {
@@ -992,11 +1018,17 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   }
 }
 
+type SignalHandlerOptions = {
+  shutdownOnStdinEnd?: boolean
+}
+
 /**
  * Sets up signal handlers for graceful shutdown
  * @param cleanup Cleanup function to run on shutdown
  */
-export function setupSignalHandlers(cleanup: () => Promise<void>) {
+export function setupSignalHandlers(cleanup: () => Promise<void>, options: SignalHandlerOptions = {}) {
+  const { shutdownOnStdinEnd = true } = options
+
   process.on('SIGINT', async () => {
     log('\nShutting down...')
     await cleanup()
@@ -1005,11 +1037,13 @@ export function setupSignalHandlers(cleanup: () => Promise<void>) {
 
   // Keep the process alive
   process.stdin.resume()
-  process.stdin.on('end', async () => {
-    log('\nShutting down...')
-    await cleanup()
-    process.exit(0)
-  })
+  if (shutdownOnStdinEnd) {
+    process.stdin.on('end', async () => {
+      log('\nShutting down...')
+      await cleanup()
+      process.exit(0)
+    })
+  }
 }
 
 /**
@@ -1027,8 +1061,9 @@ export function getServerUrlHash(serverUrl: string, authorizeResource?: string, 
   const parts = [serverUrl]
   if (authorizeResource) parts.push(authorizeResource)
   if (headers && Object.keys(headers).length > 0) {
-    const sortedKeys = Object.keys(headers).sort()
-    parts.push(JSON.stringify(headers, sortedKeys))
+    const fingerprintedHeaders = fingerprintHeadersForHash(headers)
+    const sortedKeys = Object.keys(fingerprintedHeaders).sort()
+    parts.push(JSON.stringify(fingerprintedHeaders, sortedKeys))
   }
   return crypto.createHash('md5').update(parts.join('|')).digest('hex')
 }

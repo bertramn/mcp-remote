@@ -39,6 +39,96 @@ export interface AuthLockData {
   port?: number
 }
 
+export type AuthLockClaimResult =
+  | {
+      role: 'owner'
+      lock: AuthLockData
+      created: boolean
+      replacedStaleLock?: AuthLockData
+    }
+  | {
+      role: 'waiter'
+      lock: AuthLockData
+    }
+
+const DEFAULT_AUTH_LOCK_TTL_MS = 10 * 60 * 1000
+const AUTH_LOCK_MUTEX_STALE_MS = 30 * 1000
+const AUTH_LOCK_MUTEX_POLL_MS = 25
+
+function isFreshPendingAuthLock(lock: AuthLockData | null, staleAfterMs: number): lock is AuthLockData {
+  return !!lock && lock.status === 'pending' && Date.now() - lock.timestamp <= staleAfterMs
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === 'ENOENT'
+}
+
+function isExistingFileError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === 'EEXIST'
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function getAuthLockMutexFilePath(serverUrlHash: string): string {
+  return `${getConfigFilePath(serverUrlHash, 'lock.json')}.mutex`
+}
+
+async function withAuthLockMutex<T>(serverUrlHash: string, action: () => Promise<T>): Promise<T> {
+  await ensureConfigDir()
+  const mutexPath = getAuthLockMutexFilePath(serverUrlHash)
+  let ownsMutex = false
+
+  while (!ownsMutex) {
+    try {
+      const handle = await fs.open(mutexPath, 'wx', 0o600)
+      try {
+        await handle.writeFile(JSON.stringify({ pid: process.pid, timestamp: Date.now() }, null, 2), 'utf-8')
+      } finally {
+        await handle.close()
+      }
+      ownsMutex = true
+    } catch (error) {
+      if (!isExistingFileError(error)) {
+        throw error
+      }
+
+      try {
+        const stats = await fs.stat(mutexPath)
+        if (Date.now() - stats.mtimeMs > AUTH_LOCK_MUTEX_STALE_MS) {
+          try {
+            await fs.unlink(mutexPath)
+          } catch (unlinkError) {
+            if (!isMissingFileError(unlinkError)) {
+              throw unlinkError
+            }
+          }
+          continue
+        }
+      } catch (statError) {
+        if (!isMissingFileError(statError)) {
+          throw statError
+        }
+      }
+
+      await sleep(AUTH_LOCK_MUTEX_POLL_MS)
+    }
+  }
+
+  try {
+    return await action()
+  } finally {
+    try {
+      await fs.unlink(mutexPath)
+    } catch (error) {
+      if (!isMissingFileError(error)) {
+        log(`Error deleting auth lock mutex:`, error)
+      }
+    }
+  }
+}
+
 /**
  * Creates or updates an auth lock for the given server
  * @param serverUrlHash The hash of the server URL
@@ -85,13 +175,163 @@ export async function deleteAuthLock(serverUrlHash: string): Promise<void> {
 }
 
 /**
+ * Atomically claims the auth lock for one server hash. The first process creates
+ * the lock with `wx`; later processes observe the existing fresh lock and wait.
+ * Claim, metadata updates, deletes, and stale replacement share a sidecar mutex
+ * so the active lock is never hidden while another process can claim ownership.
+ */
+export async function claimAuthLock(
+  serverUrlHash: string,
+  lockData: AuthLockData,
+  staleAfterMs = DEFAULT_AUTH_LOCK_TTL_MS,
+): Promise<AuthLockClaimResult> {
+  return withAuthLockMutex(serverUrlHash, async () => {
+    await ensureConfigDir()
+    const filePath = getConfigFilePath(serverUrlHash, 'lock.json')
+    const desiredLock = {
+      ...lockData,
+      serverUrlHash,
+      status: 'pending' as const,
+    }
+
+    let replacedStaleLock: AuthLockData | undefined
+
+    while (true) {
+      try {
+        const handle = await fs.open(filePath, 'wx', 0o600)
+        try {
+          await handle.writeFile(JSON.stringify(desiredLock, null, 2), 'utf-8')
+        } finally {
+          await handle.close()
+        }
+        return { role: 'owner', lock: desiredLock, created: true, replacedStaleLock }
+      } catch (error) {
+        if (!isExistingFileError(error)) {
+          throw error
+        }
+      }
+
+      const existingLock = await readAuthLock(serverUrlHash)
+      if (isFreshPendingAuthLock(existingLock, staleAfterMs)) {
+        if (existingLock.state === desiredLock.state) {
+          return { role: 'owner', lock: existingLock, created: false, replacedStaleLock }
+        }
+        return { role: 'waiter', lock: existingLock }
+      }
+
+      replacedStaleLock = existingLock || undefined
+      try {
+        await fs.unlink(filePath)
+      } catch (unlinkError) {
+        if (!isMissingFileError(unlinkError)) {
+          throw unlinkError
+        }
+      }
+    }
+  })
+}
+
+export async function updateAuthLockIfStateMatches(serverUrlHash: string, state: string, updates: Partial<AuthLockData>): Promise<boolean> {
+  return withAuthLockMutex(serverUrlHash, async () => {
+    const lock = await readAuthLock(serverUrlHash)
+    if (!lock || lock.state !== state || lock.serverUrlHash !== serverUrlHash) {
+      return false
+    }
+
+    const nextLock = {
+      ...lock,
+      ...updates,
+      state: lock.state,
+      serverUrlHash: lock.serverUrlHash,
+    }
+
+    const filePath = getConfigFilePath(serverUrlHash, 'lock.json')
+    const nextPath = `${filePath}.${process.pid}.${Date.now()}.next`
+    await fs.writeFile(nextPath, JSON.stringify(nextLock, null, 2), {
+      encoding: 'utf-8',
+      mode: 0o600,
+    })
+    await fs.rename(nextPath, filePath)
+    return true
+  })
+}
+
+export async function markAuthLockStatusIfStateMatches(
+  serverUrlHash: string,
+  state: string,
+  status: AuthLockData['status'],
+): Promise<boolean> {
+  return updateAuthLockIfStateMatches(serverUrlHash, state, { status })
+}
+
+export async function deleteAuthLockIfStateMatches(serverUrlHash: string, state: string): Promise<boolean> {
+  return withAuthLockMutex(serverUrlHash, async () => {
+    const lock = await readAuthLock(serverUrlHash)
+    if (!lock || lock.state !== state || lock.serverUrlHash !== serverUrlHash) {
+      return false
+    }
+
+    try {
+      await fs.unlink(getConfigFilePath(serverUrlHash, 'lock.json'))
+    } catch (error) {
+      if (!isMissingFileError(error)) {
+        throw error
+      }
+    }
+    return true
+  })
+}
+
+/**
  * Gets the configuration directory path
  * @returns The path to the configuration directory
  */
 export function getConfigDir(): string {
-  const baseConfigDir = process.env.MCP_REMOTE_CONFIG_DIR || path.join(os.homedir(), '.mcp-auth')
-  // Add a version subdirectory so we don't need to worry about backwards/forwards compatibility yet
-  return path.join(baseConfigDir, `mcp-remote-${MCP_REMOTE_VERSION}`)
+  return process.env.MCP_REMOTE_CONFIG_DIR || path.join(os.homedir(), '.mcp-auth')
+}
+
+function getLegacyConfigDir(): string {
+  return path.join(getConfigDir(), `mcp-remote-${MCP_REMOTE_VERSION}`)
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function getReadableConfigFilePath(serverUrlHash: string, filename: string): Promise<string> {
+  const currentPath = getConfigFilePath(serverUrlHash, filename)
+  if (await fileExists(currentPath)) {
+    return currentPath
+  }
+
+  const legacyPath = path.join(getLegacyConfigDir(), `${serverUrlHash}_${filename}`)
+  if (await fileExists(legacyPath)) {
+    try {
+      await ensureConfigDir()
+      const legacyStat = await fs.stat(legacyPath)
+      const content = await fs.readFile(legacyPath)
+      const handle = await fs.open(currentPath, 'wx', 0o600)
+      try {
+        await handle.writeFile(content)
+      } finally {
+        await handle.close()
+      }
+      await fs.utimes(currentPath, legacyStat.atime, legacyStat.mtime)
+    } catch (error) {
+      if (!isExistingFileError(error)) {
+        log(`Error migrating legacy ${filename}:`, error)
+        return legacyPath
+      }
+    }
+    return currentPath
+  }
+
+  return currentPath
 }
 
 /**
@@ -118,19 +358,35 @@ export function getConfigFilePath(serverUrlHash: string, filename: string): stri
   return path.join(configDir, `${serverUrlHash}_${filename}`)
 }
 
+export async function getConfigFileMtimeMs(serverUrlHash: string, filename: string): Promise<number | undefined> {
+  try {
+    const filePath = getConfigFilePath(serverUrlHash, filename)
+    const stats = await fs.stat(filePath)
+    return stats.mtimeMs
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return undefined
+    }
+    throw error
+  }
+}
+
 /**
  * Deletes a config file if it exists
  * @param serverUrlHash The hash of the server URL
  * @param filename The name of the file to delete
  */
 export async function deleteConfigFile(serverUrlHash: string, filename: string): Promise<void> {
-  try {
-    const filePath = getConfigFilePath(serverUrlHash, filename)
-    await fs.unlink(filePath)
-  } catch (error) {
-    // Ignore if file doesn't exist
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log(`Error deleting ${filename}:`, error)
+  const filePaths = [getConfigFilePath(serverUrlHash, filename), path.join(getLegacyConfigDir(), `${serverUrlHash}_${filename}`)]
+
+  for (const filePath of filePaths) {
+    try {
+      await fs.unlink(filePath)
+    } catch (error) {
+      // Ignore if file doesn't exist
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log(`Error deleting ${filename}:`, error)
+      }
     }
   }
 }
@@ -146,7 +402,7 @@ export async function readJsonFile<T>(serverUrlHash: string, filename: string, s
   try {
     await ensureConfigDir()
 
-    const filePath = getConfigFilePath(serverUrlHash, filename)
+    const filePath = await getReadableConfigFilePath(serverUrlHash, filename)
     const content = await fs.readFile(filePath, 'utf-8')
     const result = await schema.parseAsync(JSON.parse(content))
     // console.log({ filename: result })
@@ -188,7 +444,7 @@ export async function writeJsonFile(serverUrlHash: string, filename: string, dat
 export async function readTextFile(serverUrlHash: string, filename: string, errorMessage?: string): Promise<string> {
   try {
     await ensureConfigDir()
-    const filePath = getConfigFilePath(serverUrlHash, filename)
+    const filePath = await getReadableConfigFilePath(serverUrlHash, filename)
     return await fs.readFile(filePath, 'utf-8')
   } catch (error) {
     throw new Error(errorMessage || `Error reading ${filename}`)

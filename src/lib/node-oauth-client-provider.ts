@@ -7,7 +7,15 @@ import {
   OAuthTokensSchema,
 } from '@modelcontextprotocol/sdk/shared/auth.js'
 import type { OAuthProviderOptions, StaticOAuthClientMetadata } from './types'
-import { readJsonFile, writeJsonFile, deleteConfigFile, readAuthLock, writeAuthLock, deleteAuthLock } from './mcp-auth-config'
+import {
+  claimAuthLock,
+  deleteAuthLockIfStateMatches,
+  deleteConfigFile,
+  readAuthLock,
+  readJsonFile,
+  updateAuthLockIfStateMatches,
+  writeJsonFile,
+} from './mcp-auth-config'
 import { StaticOAuthClientInformationFull } from './types'
 import { log, debugLog, MCP_REMOTE_VERSION } from './utils'
 import { sanitizeUrl } from 'strict-url-sanitise'
@@ -91,6 +99,10 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
   state(): string {
     return this._state
+  }
+
+  setAuthLockState(state: string): void {
+    this._state = state
   }
 
   async validateResourceURL(serverUrl: string | URL, resource?: string): Promise<URL | undefined> {
@@ -288,16 +300,30 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     authorizationUrl.searchParams.set('scope', effectiveScope)
     debugLog('Added scope parameter to authorization URL', { scopes: effectiveScope })
 
-    const existingLock = await readAuthLock(this.serverUrlHash)
-    const sameStatePendingAuth = isReusablePendingAuthLock(existingLock, this._state)
-    const otherProcessPendingAuth = isFreshPendingAuthLock(existingLock) && existingLock.state !== this._state
-    const reuseExistingAuth = sameStatePendingAuth && !!existingLock.authorizationUrl
-    const skipBrowserOpen = reuseExistingAuth || otherProcessPendingAuth
-    const authUrlToUse = reuseExistingAuth ? existingLock.authorizationUrl! : authorizationUrl.toString()
+    const resource = this.authorizeResource || ''
+    const claimResult = await claimAuthLock(this.serverUrlHash, {
+      state: this._state,
+      serverUrlHash: this.serverUrlHash,
+      serverUrl: this.options.serverUrl,
+      resource,
+      timestamp: Date.now(),
+      status: 'pending',
+      pid: process.pid,
+      authorizationUrl: authorizationUrl.toString(),
+      port: this.options.callbackPort,
+    })
 
-    if (existingLock && !otherProcessPendingAuth) {
-      await writeAuthLock(this.serverUrlHash, {
-        ...existingLock,
+    const reuseExistingAuth =
+      claimResult.role === 'owner' && !claimResult.created && claimResult.lock.state === this._state && !!claimResult.lock.authorizationUrl
+    const authUrlToUse =
+      claimResult.role === 'waiter'
+        ? claimResult.lock.authorizationUrl || 'authorization already pending in another process'
+        : reuseExistingAuth
+          ? claimResult.lock.authorizationUrl!
+          : authorizationUrl.toString()
+
+    if (claimResult.role === 'owner' && !reuseExistingAuth) {
+      await updateAuthLockIfStateMatches(this.serverUrlHash, this._state, {
         authorizationUrl: authUrlToUse,
         port: this.options.callbackPort,
       })
@@ -307,12 +333,12 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     debugLog('Redirecting to authorization URL', authUrlToUse)
 
-    if (skipBrowserOpen) {
+    if (claimResult.role === 'waiter' || reuseExistingAuth) {
       log('Authorization already pending. Reusing existing browser consent flow.')
       debugLog('Skipping browser reopen for existing pending auth lock', {
         serverUrlHash: this.serverUrlHash,
         state: this._state,
-        existingState: existingLock?.state,
+        existingState: claimResult.lock.state,
       })
       return
     }
@@ -333,8 +359,19 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   async saveCodeVerifier(codeVerifier: string): Promise<void> {
     debugLog('Saving code verifier')
     const resource = this.authorizeResource || ''
-    const existingLock = await readAuthLock(this.serverUrlHash)
-    if (isReusablePendingAuthLock(existingLock, this._state) && existingLock.codeVerifier) {
+    const claimResult = await claimAuthLock(this.serverUrlHash, {
+      state: this._state,
+      serverUrlHash: this.serverUrlHash,
+      serverUrl: this.options.serverUrl,
+      resource,
+      timestamp: Date.now(),
+      status: 'pending',
+      pid: process.pid,
+      port: this.options.callbackPort,
+      codeVerifier,
+    })
+
+    if (claimResult.role === 'owner' && isReusablePendingAuthLock(claimResult.lock, this._state) && claimResult.lock.codeVerifier) {
       debugLog('Pending auth lock already has code verifier, reusing existing verifier', {
         serverUrlHash: this.serverUrlHash,
         state: this._state,
@@ -342,26 +379,18 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       return
     }
 
-    if (isFreshPendingAuthLock(existingLock) && existingLock.state !== this._state) {
+    if (claimResult.role === 'waiter') {
       debugLog('Another pending auth lock owns the code verifier, skipping overwrite', {
         serverUrlHash: this.serverUrlHash,
         state: this._state,
-        existingState: existingLock.state,
+        existingState: claimResult.lock.state,
       })
       return
     }
 
-    await writeAuthLock(this.serverUrlHash, {
-      state: this._state,
-      serverUrlHash: this.serverUrlHash,
-      serverUrl: this.options.serverUrl,
-      resource,
-      timestamp: existingLock?.timestamp || Date.now(),
-      status: 'pending',
-      pid: process.pid,
-      authorizationUrl: existingLock?.authorizationUrl,
-      port: this.options.callbackPort,
+    await updateAuthLockIfStateMatches(this.serverUrlHash, this._state, {
       codeVerifier,
+      port: this.options.callbackPort,
     })
   }
 
@@ -372,7 +401,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   async codeVerifier(): Promise<string> {
     debugLog('Reading code verifier')
     const lock = await readAuthLock(this.serverUrlHash)
-    if (lock?.codeVerifier) {
+    if (lock?.state === this._state && lock.codeVerifier) {
       debugLog('Code verifier found in auth lock')
       return lock.codeVerifier
     }
@@ -391,7 +420,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         await Promise.all([
           deleteConfigFile(this.serverUrlHash, 'client_info.json'),
           deleteConfigFile(this.serverUrlHash, 'tokens.json'),
-          deleteAuthLock(this.serverUrlHash),
+          deleteAuthLockIfStateMatches(this.serverUrlHash, this._state),
         ])
         this._clientInfo = undefined
         debugLog('All credentials invalidated')
@@ -409,7 +438,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         break
 
       case 'verifier':
-        await deleteAuthLock(this.serverUrlHash)
+        await deleteAuthLockIfStateMatches(this.serverUrlHash, this._state)
         debugLog('Code verifier invalidated')
         break
 

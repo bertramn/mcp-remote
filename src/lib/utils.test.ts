@@ -52,6 +52,7 @@ describe('Feature: Command Line Arguments Parsing', () => {
     // Then both server URL and callback port should be correctly extracted
     expect(result.serverUrl).toBe('https://example.com/sse')
     expect(result.callbackPort).toBe(3000)
+    expect(result.callbackPortSpecified).toBe(true)
   })
 
   it('Scenario: Parse localhost URL with HTTP protocol', async () => {
